@@ -3,7 +3,7 @@ Transform a Raspberry Pi (3+ or 4) into a music identifying station for vinyl re
 
 This station listens to a turntable through a USB phono preamp, identifies a track with SongRec, and publishes the current result to a local web dashboard.
 ### AI Disclaimer: 
-This code has largely been created with the help of AI and then fine-tuned by a human. Every effort has been made by the published to verify that there is no malicious code present.
+This code has largely been created with the help of AI and then fine-tuned by a human. Every effort has been made by the human to verify that there is no malicious code present.
 
 `install-songrec-station.sh` provisions a Raspberry Pi 3+ running Raspberry Pi OS and creates a `systemd` service that identifies vinyl tracks from a USB phono preamp.
 
