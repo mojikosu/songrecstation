@@ -1,0 +1,65 @@
+# Add this to Home Assistant's configuration.yaml, then restart Home Assistant.
+# Replace 192.168.39.18 with the address of the SongRec Raspberry Pi.
+#
+# The endpoint is read fresh from current.json on every request. A one-second
+# scan interval is the fastest dependable HTTP-only option in Home Assistant.
+# It is light enough for the Pi because it only reads one small local JSON file.
+rest:
+  - resource: "http://192.168.39.18:8080/api/home-assistant"
+    scan_interval: 1
+    timeout: 2
+    sensor:
+      - name: "Lounge Tune"
+        # revision is the current.json write timestamp. Using it as the state
+        # makes every new recognition an actual Home Assistant state change.
+        value_template: "{{ value_json.revision | default('waiting', true) }}"
+        picture: "{{ value_json.artwork_url | default('', true) }}"
+        json_attributes:
+          - state
+          - revision
+          - updated_at
+          - sample_started_at
+          - message
+          - error
+          - title
+          - artist
+          - album
+          - genre
+          - released
+          - label
+          - track_key
+          - shazam_url
+          - artwork_url
+          - palette_rgb
+          - palette_hex
+          - palette_hsbk
+          - raw_songrec_path
+
+# Optional: retain SongRec's unmodified raw response as an attribute. It is
+# larger than the compact station sensor above, so use it only when you need
+# fields which are not already exposed there.
+  - resource: "http://192.168.39.18:8080/api/songrec.json"
+    scan_interval: 1
+    timeout: 2
+    sensor:
+      - name: "Lounge Tune SongRec Raw"
+        value_template: "{{ value_json.track.title | default('waiting', true) }}"
+        json_attributes:
+          - track
+          - matches
+
+# Example trigger for a light-colour automation. The attribute changes with
+# each JSON write, including a repeat of the same track.
+#
+# automation:
+#   - alias: Tasogare-kun artwork updated
+#     triggers:
+#       - trigger: state
+#         entity_id: sensor.tasogare_kun_station
+#         attribute: revision
+#     actions:
+#       # Pass this URL to your artwork colour-extraction or LED integration.
+#       - action: persistent_notification.create
+#         data:
+#           title: Album artwork changed
+#           message: "{{ state_attr('sensor.tasogare_kun_station', 'artwork_url') }}"

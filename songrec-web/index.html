@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#11110f">
+  <title>Tasogare-kun no Station</title>
+  <link rel="stylesheet" href="/app.css">
+  <link rel="stylesheet" href="/lyrics.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="masthead">
+      <a class="brand" href="/" aria-label="Tasogare-kun no Station home"><span class="brand-mark">夕</span><span>Tasogare-kun <b>no Station</b></span></a>
+      <div class="live"><i></i><span id="connection">Connecting</span></div>
+    </header>
+
+    <section class="now-playing" aria-live="polite">
+      <div id="cover" class="cover cover-empty" aria-label="Album artwork"><span>♫</span></div>
+      <div class="track-copy">
+        <p class="eyebrow" id="state-label">Listening for a record</p>
+        <h1 id="title">Nothing playing yet</h1>
+        <p class="artist" id="artist">Place the needle and let the station listen.</p>
+        <p class="album" id="album"></p>
+        <div class="actions" id="actions" hidden>
+          <a id="shazam-link" class="listen-link" target="_blank" rel="noopener">Open in Shazam <span>↗</span></a>
+          <a id="lyrics-link" class="listen-link" target="_blank" rel="noopener">View lyrics on Shazam <span>↗</span></a>
+        </div>
+      </div>
+      <aside class="signal-card">
+        <p class="mini-label">Station status</p>
+        <strong id="status">Waiting</strong>
+        <p id="updated">—</p>
+      </aside>
+    </section>
+
+    <section class="details" id="details" hidden>
+      <div class="detail"><span>Album</span><strong id="detail-album">—</strong></div>
+      <div class="detail"><span>Genre</span><strong id="genre">—</strong></div>
+      <div class="detail"><span>Released</span><strong id="released">—</strong></div>
+      <div class="detail"><span>Label</span><strong id="label">—</strong></div>
+    </section>
+
+    <section class="lyrics-section" id="lyrics-section" hidden>
+      <div class="section-heading"><div><p class="eyebrow">Words on the record</p><h2>Lyrics</h2></div></div>
+      <pre id="lyrics"></pre>
+    </section>
+
+    <section class="recent-section">
+      <div class="section-heading"><div><p class="eyebrow">Session log</p><h2>Recently heard</h2></div><span id="history-count"></span></div>
+      <ol class="history" id="history"><li class="empty-history">Recognized tracks will appear here.</li></ol>
+    </section>
+  </main>
+  <footer>Tasogare-kun no Station · Your turntable, indexed in real time</footer>
+  <script src="/app.js"></script>
+</body>
+</html>

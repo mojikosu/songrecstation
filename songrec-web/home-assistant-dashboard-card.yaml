@@ -1,0 +1,12 @@
+# Dashboard card: Add Card → Manual, then paste this YAML.
+# If your REST sensor has a different entity ID, replace sensor.lounge_tune.
+type: picture-entity
+entity: sensor.lounge_tune
+name: Lounge Tune
+show_entity_picture: true
+show_name: true
+show_state: false
+aspect_ratio: "1:1"
+fit_mode: contain
+tap_action:
+  action: more-info

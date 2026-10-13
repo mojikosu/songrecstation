@@ -1,0 +1,30 @@
+# Add as a Home Assistant automation. Replace light.lounge_beam with your
+# Beam's actual LIFX light entity. It needs the local LIFX integration.
+#
+# The station provides palette_hsbk as 2-5 [hue, saturation, brightness,
+# Kelvin] colors from the current cover. lifx.paint_theme distributes that
+# palette over Beam's individual zones in one local-network command.
+alias: "Lounge Beam follows album artwork"
+description: "Paint the LIFX Beam with the current SongRec cover palette."
+mode: restart
+triggers:
+  - trigger: state
+    entity_id: sensor.lounge_tune
+    attribute: revision
+conditions:
+  - condition: template
+    value_template: >
+      {% set palette = state_attr('sensor.lounge_tune', 'palette_hsbk') or [] %}
+      {{ state_attr('sensor.lounge_tune', 'state') == 'identified' and palette | length >= 2 }}
+actions:
+  # A running firmware effect would overwrite the still album-art palette.
+  - action: lifx.effect_stop
+    target:
+      entity_id: light.lounge_beam
+  - action: lifx.paint_theme
+    target:
+      entity_id: light.lounge_beam
+    data:
+      palette: "{{ state_attr('sensor.lounge_tune', 'palette_hsbk') }}"
+      transition: 3
+      power_on: true

@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+# SongRec turntable station installer for Raspberry Pi OS (64-bit preferred).
+#
+# Run from a normal login account:
+#   chmod +x install-songrec-station.sh
+#   ./install-songrec-station.sh "hw:1,0"
+#
+# Find the USB phono preamp's ALSA device with:
+#   arecord -l
+#
+# The argument is optional; "default" is used when it is omitted.
+set -Eeuo pipefail
+
+if [[ "${EUID}" -eq 0 ]]; then
+  echo "Run this installer as the account that will own the station; it uses sudo when needed." >&2
+  exit 1
+fi
+
+STATION_USER="${SUDO_USER:-$(id -un)}"
+if [[ -z "${STATION_USER}" ]]; then
+  echo "Cannot determine the user account that should own the station." >&2
+  exit 1
+fi
+
+STATION_HOME="$(getent passwd "${STATION_USER}" | cut -d: -f6)"
+if [[ -z "${STATION_HOME}" || ! -d "${STATION_HOME}" ]]; then
+  echo "Cannot determine the home directory for ${STATION_USER}." >&2
+  exit 1
+fi
+
+AUDIO_DEVICE="${1:-default}"
+# Accept the easy-to-type but invalid ALSA shorthand "hw1:0" and normalize it
+# to the actual ALSA device notation, "hw:1,0".
+if [[ "${AUDIO_DEVICE}" =~ ^hw([0-9]+):([0-9]+)$ ]]; then
+  AUDIO_DEVICE="hw:${BASH_REMATCH[1]},${BASH_REMATCH[2]}"
+fi
+INSTALL_DIR="/opt/songrec-station"
+DATA_DIR="/var/lib/songrec-station"
+ENV_FILE="/etc/songrec-station.env"
+SERVICE_FILE="/etc/systemd/system/songrec-station.service"
+BUILD_SWAPFILE="/var/tmp/songrec-build.swap"
+BUILD_WORK_DIR="/var/lib/songrec-build"
+CARGO_TARGET_DIR="${BUILD_WORK_DIR}/target"
+CARGO_BUILD_DIR="${BUILD_WORK_DIR}/build"
+# Keep a shell-safe default even when this installer is sourced or run with a
+# sparse environment under `set -u`.
+BUILD_SWAP_MIB="${BUILD_SWAP_MIB:-2048}"
+# One compiler process is the safe default for a 1 GiB Pi 3+. It can be raised
+# explicitly after a successful build proves the hardware stays responsive.
+BUILD_JOBS="${BUILD_JOBS:-1}"
+BUILD_SWAP_ACTIVE=0
+
+# Fail early if a required command is missing.
+for cmd in sudo getent id awk cut; do
+  if ! command -v "${cmd}" >/dev/null 2>&1; then
+    echo "Required command not found: ${cmd}" >&2
+    exit 1
+  fi
+done
+
+if ! [[ "${BUILD_JOBS}" =~ ^[1-4]$ ]]; then
+  echo "BUILD_JOBS must be a whole number from 1 through 4; got: ${BUILD_JOBS}" >&2
+  exit 1
+fi
+
+# Ask for sudo upfront so the rest of the script is not interrupted partway through.
+if ! sudo -n true 2>/dev/null; then
+  sudo true
+fi
+
+# Compiling Rust crates on a 1 GiB Pi 3+ can otherwise be killed by the OOM
+# manager.  This is deliberately temporary: a persistent large swap file adds
+# SD-card writes while the station is only capturing and identifying music.
+existing_swap_kib="$(awk 'NR > 1 { total += $3 } END { print total + 0 }' /proc/swaps)"
+if (( existing_swap_kib < 1572864 )); then
+  available_mib="$(df -Pm /var/tmp | awk 'NR == 2 { print $4 }')"
+  if (( available_mib < ${BUILD_SWAP_MIB:-2048} + 512 )); then
+    echo "Need at least $(( ${BUILD_SWAP_MIB:-2048} + 512 )) MiB free in /var/tmp for the temporary build swap file; found ${available_mib} MiB." >&2
+    exit 1
+  fi
+  echo "Enabling a temporary ${BUILD_SWAP_MIB:-2048} MiB swap file for the SongRec build..."
+  sudo rm -f "${BUILD_SWAPFILE}"
+  if ! sudo fallocate -l "${BUILD_SWAP_MIB:-2048}M" "${BUILD_SWAPFILE}"; then
+    sudo dd if=/dev/zero of="${BUILD_SWAPFILE}" bs=1M count="${BUILD_SWAP_MIB:-2048}" status=progress
+  fi
+  sudo chmod 600 "${BUILD_SWAPFILE}"
+  sudo mkswap "${BUILD_SWAPFILE}" >/dev/null
+  sudo swapon "${BUILD_SWAPFILE}"
+  BUILD_SWAP_ACTIVE=1
+fi
+
+cleanup_build_swap() {
+  if (( BUILD_SWAP_ACTIVE )); then
+    echo "Removing temporary build swap file..."
+    sudo swapoff "${BUILD_SWAPFILE}" || true
+    sudo rm -f "${BUILD_SWAPFILE}"
+  fi
+}
+trap cleanup_build_swap EXIT
+
+echo "Installing build and audio dependencies..."
+sudo env DEBIAN_FRONTEND=noninteractive apt-get update
+sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+  alsa-utils build-essential ca-certificates curl git libasound2-dev \
+  libclang-dev libglib2.0-dev libpipewire-0.3-dev libpulse-dev libssl-dev pkg-config python3
+ 
+echo "Installing the current stable Rust toolchain for ${STATION_USER}..."
+sudo -u "${STATION_USER}" -H bash -lc '
+  export PATH="$HOME/.cargo/bin:$PATH"
+  if ! command -v rustup >/dev/null 2>&1; then
+    curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  fi
+  "$HOME/.cargo/bin/rustup" toolchain install stable --profile minimal
+  "$HOME/.cargo/bin/rustup" default stable
+'
+
+
+echo "Compiling SongRec headless CLI (this can take a while on a Pi 3+)..."
+# cargo install otherwise creates its target directory under /tmp. On many Pi
+# images /tmp is a small tmpfs, so compilation fails long before the SD card is
+# full. Keep both final and intermediate Cargo artifacts on the root filesystem.
+sudo install -d -o "${STATION_USER}" -g "${STATION_USER}" -m 0755 "${BUILD_WORK_DIR}"
+build_free_mib="$(df -Pm "${BUILD_WORK_DIR}" | awk 'NR == 2 { print $4 }')"
+if (( build_free_mib < 4096 )); then
+  echo "Need at least 4096 MiB free in ${BUILD_WORK_DIR} for a SongRec build; found ${build_free_mib} MiB." >&2
+  exit 1
+fi
+# A Pi 3+ has 1 GiB RAM. One compiler job plus one codegen unit avoids the
+# rustc memory spikes that can make SSH/network services unresponsive.
+# nice/ionice let system services win when they need CPU or I/O.
+# Build CLI without GUI: --no-default-features disables adwaita (GUI).
+# The binary will use ALSA by default for audio input and WAV output.
+# The extra audio development packages keep the build compatible with current upstream changes.
+sudo -u "${STATION_USER}" -H env \
+  CARGO_BUILD_JOBS="${BUILD_JOBS}" CARGO_INCREMENTAL=0 \
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 \
+  CARGO_TARGET_DIR="${CARGO_TARGET_DIR}" CARGO_BUILD_BUILD_DIR="${CARGO_BUILD_DIR}" bash -lc '
+  export PATH="$HOME/.cargo/bin:$PATH"
+  exec nice -n 19 ionice -c3 cargo install --jobs "$CARGO_BUILD_JOBS" --target-dir "$CARGO_TARGET_DIR" \
+    --git https://github.com/marin-m/SongRec.git --no-default-features --force songrec
+'
+
+if [[ ! -x "${STATION_HOME}/.cargo/bin/songrec" ]]; then
+  echo "SongRec binary was not installed under ${STATION_HOME}/.cargo/bin." >&2
+  exit 1
+fi
+
+sudo install -d -o "${STATION_USER}" -g "${STATION_USER}" -m 0755 "${INSTALL_DIR}" "${DATA_DIR}"
+sudo install -o "${STATION_USER}" -g "${STATION_USER}" -m 0755 \
+  "${STATION_HOME}/.cargo/bin/songrec" "${INSTALL_DIR}/songrec"
+
+echo "Installing the station worker..."
+sudo tee "${INSTALL_DIR}/songrec_station.py" >/dev/null <<'PYTHON'
+#!/usr/bin/env python3
+"""Gate SongRec's one-shot microphone recognition and publish JSON."""
+import json
+import os
+import shutil
+import signal
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+ENV_PATH = "/etc/songrec-station.env"
+
+
+def env_file(path):
+    values = {}
+    try:
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
+    return values
+
+
+CONFIG = env_file(ENV_PATH)
+DEVICE = CONFIG.get("AUDIO_DEVICE", "default")
+SONGREC_DEVICE = CONFIG.get("SONGREC_DEVICE", "")
+SONGREC_REQUEST_INTERVAL = CONFIG.get("SONGREC_REQUEST_INTERVAL", "5")
+RATE = int(CONFIG.get("SAMPLE_RATE", "44100"))
+CHANNELS = int(CONFIG.get("CHANNELS", "1"))
+SILENCE_RMS = int(CONFIG.get("SILENCE_RMS", "350"))
+CHUNK_SECONDS = float(CONFIG.get("CHUNK_SECONDS", "0.25"))
+START_AUDIO_SECONDS = float(CONFIG.get("START_AUDIO_SECONDS", "3"))
+END_SILENCE_SECONDS = float(CONFIG.get("END_SILENCE_SECONDS", "4"))
+SONGREC_TIMEOUT_SECONDS = int(CONFIG.get("SONGREC_TIMEOUT_SECONDS", "90"))
+DATA_DIR = Path(CONFIG.get("DATA_DIR", "/var/lib/songrec-station"))
+SONGREC = CONFIG.get("SONGREC_BIN", "/opt/songrec-station/songrec")
+FRAME_BYTES = max(2 * CHANNELS, int(RATE * CHUNK_SECONDS) * 2 * CHANNELS)
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def rms_s16le(data):
+    """Return RMS for little-endian signed 16-bit PCM without extra packages."""
+    samples = memoryview(data).cast("h")
+    if not samples:
+        return 0
+    return int((sum(sample * sample for sample in samples) / len(samples)) ** 0.5)
+
+
+def publish(payload):
+    """Atomically replace the document polled by the web application."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    payload["updated_at"] = now()
+    output = DATA_DIR / "current.json"
+    temp = DATA_DIR / ".current.json.tmp"
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp, output)
+
+
+def append_history(payload):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with (DATA_DIR / "history.ndjson").open("a", encoding="utf-8") as output:
+        output.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def identify(started_at):
+    """Run one direct SongRec microphone recognition against the USB device."""
+    publish({
+        "state": "identifying",
+        "sample_started_at": started_at,
+        "message": "Identifying this track...",
+    })
+
+    try:
+        command = [SONGREC, "recognize", "--json", "--request-interval", SONGREC_REQUEST_INTERVAL]
+        if SONGREC_DEVICE:
+            command.extend(["--audio-device", SONGREC_DEVICE])
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=SONGREC_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "state": "not_found",
+            "sample_started_at": started_at,
+            "error": "SongRec timed out.",
+        }
+
+    stdout = result.stdout.strip()
+    if result.returncode != 0:
+        return {
+            "state": "not_found",
+            "sample_started_at": started_at,
+            "error": result.stderr.strip() or "SongRec failed.",
+        }
+
+    try:
+        songrec_response = json.loads(stdout)
+    except json.JSONDecodeError:
+        return {
+            "state": "not_found",
+            "sample_started_at": started_at,
+            "error": "No recognized song.",
+            "songrec_stdout": stdout,
+        }
+
+    return {
+        "state": "identified",
+        "sample_started_at": started_at,
+        "songrec": songrec_response,
+    }
+
+
+def main():
+    if shutil.which("arecord") is None:
+        raise RuntimeError("arecord is not installed or not on PATH.")
+    if not os.path.exists(SONGREC):
+        raise RuntimeError(f"SongRec binary not found: {SONGREC}")
+
+    publish({"state": "waiting_for_audio", "message": "Waiting for a record..."})
+
+    command = [
+        "arecord",
+        "-q",
+        "-D",
+        DEVICE,
+        "-f",
+        "S16_LE",
+        "-c",
+        str(CHANNELS),
+        "-r",
+        str(RATE),
+        "-t",
+        "raw",
+    ]
+    def start_recorder():
+        return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+
+    recorder = start_recorder()
+
+    def stop(*_):
+        recorder.terminate()
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    active_for = 0.0
+    silent_for = 0.0
+    waiting_for_gap = False
+
+    while True:
+        data = recorder.stdout.read(FRAME_BYTES)
+        if not data:
+            stderr = recorder.stderr.read().decode(errors="replace")
+            raise RuntimeError("arecord stopped: " + stderr)
+
+        is_audio = rms_s16le(data) >= SILENCE_RMS
+        duration = len(data) / (RATE * CHANNELS * 2)
+
+        if waiting_for_gap:
+            silent_for = silent_for + duration if not is_audio else 0.0
+            if silent_for >= END_SILENCE_SECONDS:
+                waiting_for_gap = False
+                active_for = 0.0
+                silent_for = 0.0
+                publish({"state": "waiting_for_audio", "message": "Waiting for the next record..."})
+            continue
+
+        active_for = active_for + duration if is_audio else 0.0
+        if active_for >= START_AUDIO_SECONDS:
+            started_at = now()
+            # arecord owns the ALSA device while detecting silence. Release it
+            # before SongRec opens that same device for its one-shot capture.
+            recorder.terminate()
+            try:
+                recorder.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                recorder.kill()
+                recorder.wait()
+            outcome = identify(started_at)
+            publish(outcome)
+            append_history(outcome)
+            waiting_for_gap = True
+            silent_for = 0.0
+            active_for = 0.0
+            recorder = start_recorder()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as error:
+        publish({"state": "error", "message": str(error)})
+        raise
+PYTHON
+sudo chown "${STATION_USER}:${STATION_USER}" "${INSTALL_DIR}/songrec_station.py"
+sudo chmod 0755 "${INSTALL_DIR}/songrec_station.py"
+
+sudo tee "${ENV_FILE}" >/dev/null <<EOF
+# Change AUDIO_DEVICE after running: arecord -l
+AUDIO_DEVICE=${AUDIO_DEVICE}
+# SongRec uses its own device identifiers, not ALSA's hw:N,M syntax. List them
+# with: /opt/songrec-station/songrec recognize --list-devices
+SONGREC_DEVICE=alsa:hw:CARD=CODEC,DEV=0
+# Seconds SongRec listens before a recognition request. Lower is faster but
+# gives Shazam less audio to fingerprint; 5 is a practical starting point.
+SONGREC_REQUEST_INTERVAL=5
+# USB interfaces commonly support 44100 or 48000. Use the rate reported by arecord -D "${AUDIO_DEVICE}" --dump-hw-params /dev/zero.
+SAMPLE_RATE=44100
+CHANNELS=1
+# RMS threshold (0-32767). Raise it if surface noise starts captures; lower it if music is missed.
+SILENCE_RMS=350
+START_AUDIO_SECONDS=3
+END_SILENCE_SECONDS=4
+SONGREC_TIMEOUT_SECONDS=90
+DATA_DIR=${DATA_DIR}
+SONGREC_BIN=${INSTALL_DIR}/songrec
+EOF
+sudo chmod 0644 "${ENV_FILE}"
+
+sudo tee "${SERVICE_FILE}" >/dev/null <<EOF
+[Unit]
+Description=SongRec turntable identification station
+After=network-online.target sound.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=${STATION_USER}
+Group=${STATION_USER}
+Environment=HOME=${STATION_HOME}
+EnvironmentFile=${ENV_FILE}
+WorkingDirectory=${DATA_DIR}
+ExecStart=${INSTALL_DIR}/songrec_station.py
+Restart=on-failure
+RestartSec=5
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=${DATA_DIR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now songrec-station.service
+
+echo
+echo "SongRec station is running. Check it with:"
+echo "  sudo systemctl status songrec-station"
+echo "  journalctl -u songrec-station -f"
+echo "  cat ${DATA_DIR}/current.json"
+echo
+echo "Before building a web UI, confirm the correct capture device and tune SILENCE_RMS in ${ENV_FILE}."
