@@ -69,6 +69,36 @@ if ! sudo -n true 2>/dev/null; then
   sudo true
 fi
 
+# Keep HDMI video for the public display, but remove the Pi's onboard ALSA
+# devices (HDMI audio and the 3.5 mm headphone jack). SongRec always uses the
+# explicit USB device configured below, so this prevents an onboard device
+# accidentally becoming the capture target after a reboot.
+BOOT_CONFIG=""
+for candidate in /boot/firmware/config.txt /boot/config.txt; do
+  if [[ -f "${candidate}" ]]; then
+    BOOT_CONFIG="${candidate}"
+    break
+  fi
+done
+if [[ -n "${BOOT_CONFIG}" ]]; then
+  sudo sed -i '/^# BEGIN SongRec Station onboard audio$/,/^# END SongRec Station onboard audio$/d' "${BOOT_CONFIG}"
+  sudo tee -a "${BOOT_CONFIG}" >/dev/null <<'EOF'
+
+# BEGIN SongRec Station onboard audio
+# Keep HDMI video enabled; disable only the Pi's onboard analogue/HDMI audio.
+dtparam=audio=off
+# END SongRec Station onboard audio
+EOF
+else
+  echo "Warning: could not find config.txt; onboard audio will only be disabled by the module blacklist." >&2
+fi
+sudo tee /etc/modprobe.d/songrec-station-disable-onboard-audio.conf >/dev/null <<'EOF'
+# Preserve USB audio while preventing Raspberry Pi analogue and HDMI ALSA devices.
+blacklist snd_bcm2835
+blacklist snd_soc_hdmi_codec
+EOF
+echo "Onboard HDMI/headphone audio will be disabled after the next reboot; HDMI video is unaffected."
+
 # Compiling Rust crates on a 1 GiB Pi 3+ can otherwise be killed by the OOM
 # manager.  This is deliberately temporary: a persistent large swap file adds
 # SD-card writes while the station is only capturing and identifying music.
