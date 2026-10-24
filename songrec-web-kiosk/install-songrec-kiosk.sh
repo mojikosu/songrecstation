@@ -128,7 +128,7 @@ sudo chmod 0644 "${LIGHTDM_DROPIN}"
 if [[ -f /etc/lightdm/lightdm.conf ]]; then
   sudo sed -i -E "s|^([[:space:]]*autologin-user=).*|\\1${KIOSK_USER}|" \
     /etc/lightdm/lightdm.conf
-  sudo sed -i -E 's|^([[:space:]]*autologin-user-timeout=).*|\\10|' \
+  sudo sed -i -E 's|^([[:space:]]*autologin-user-timeout=).*|\10|' \
     /etc/lightdm/lightdm.conf
   sudo sed -i -E "s|^([[:space:]]*autologin-session=).*|\\1${DESKTOP_SESSION}|" \
     /etc/lightdm/lightdm.conf
