@@ -27,6 +27,7 @@ if [[ -z "${STATION_HOME}" || ! -d "${STATION_HOME}" ]]; then
   echo "Cannot determine the home directory for ${STATION_USER}." >&2
   exit 1
 fi
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 AUDIO_DEVICE="${1:-default}"
 # Accept the easy-to-type but invalid ALSA shorthand "hw1:0" and normalize it
@@ -359,6 +360,16 @@ if __name__ == "__main__":
 PYTHON
 sudo chown "${STATION_USER}:${STATION_USER}" "${INSTALL_DIR}/songrec_station.py"
 sudo chmod 0755 "${INSTALL_DIR}/songrec_station.py"
+# The maintained worker lives beside this installer so it can also be upgraded
+# independently without rebuilding Rust. The preceding embedded worker remains
+# only for backwards compatibility with earlier single-file installer copies.
+WORKER_SOURCE="${SOURCE_DIR}/songrec-station-worker.py"
+if [[ ! -f "${WORKER_SOURCE}" ]]; then
+  echo "Missing ${WORKER_SOURCE}; copy the complete station output folder before running the installer." >&2
+  exit 1
+fi
+sudo install -o "${STATION_USER}" -g "${STATION_USER}" -m 0755 \
+  "${WORKER_SOURCE}" "${INSTALL_DIR}/songrec_station.py"
 
 sudo tee "${ENV_FILE}" >/dev/null <<EOF
 # Change AUDIO_DEVICE after running: arecord -l
@@ -369,6 +380,15 @@ SONGREC_DEVICE=alsa:hw:CARD=CODEC,DEV=0
 # Seconds SongRec listens before a recognition request. Lower is faster but
 # gives Shazam less audio to fingerprint; 5 is a practical starting point.
 SONGREC_REQUEST_INTERVAL=5
+# Select 'silence' for one recognition per record side, or 'continuous' to
+# detect changes in gapless/DJ mixes using persistent SongRec listening.
+DETECTION_MODE=silence
+# Continuous mode request interval. Eight seconds is responsive while being
+# gentler on Shazam than a very aggressive polling rate.
+CONTINUOUS_REQUEST_INTERVAL=8
+# A new continuous-listening result is held for this many seconds before it is
+# published. A return to the previous track during that time cancels it.
+CHANGE_CONFIRM_SECONDS=12
 # USB interfaces commonly support 44100 or 48000. Use the rate reported by arecord -D "${AUDIO_DEVICE}" --dump-hw-params /dev/zero.
 SAMPLE_RATE=44100
 CHANNELS=1
