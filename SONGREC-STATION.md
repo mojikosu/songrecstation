@@ -43,6 +43,59 @@ After an identification, the input must stay below `SILENCE_RMS` for four contin
 
 The safety limit for one SongRec run. When no result returns within 90 seconds, the station records a timeout and resumes its normal listening state.
 
+# SongRec station modes
+
+The service reads `/etc/songrec-station.env` when it starts. After changing a
+value, restart it with:
+
+```sh
+sudo systemctl restart songrec-station
+```
+
+## `DETECTION_MODE=silence`
+
+This is the default and preserves the original turntable behaviour. `arecord`
+measures the input level, SongRec runs once after `START_AUDIO_SECONDS` of
+audio, and the worker waits for `END_SILENCE_SECONDS` before it can identify a
+new record.
+
+Use it for ordinary listening with a silent gap between records.
+
+## `DETECTION_MODE=continuous`
+
+This mode runs one persistent command equivalent to:
+
+```sh
+/opt/songrec-station/songrec listen --json --disable-mpris \
+  --audio-device alsa:hw:CARD=CODEC,DEV=0 --request-interval 8
+```
+
+It is intended for DJ sets and gapless playback. A silence gap is not required.
+The worker keeps the current track until a different identity is confirmed,
+which avoids changing the web page and Home Assistant state for a single
+spurious Shazam match during a crossfade.
+
+Recommended starting values:
+
+```ini
+DETECTION_MODE=continuous
+CONTINUOUS_REQUEST_INTERVAL=8
+CHANGE_CONFIRM_SECONDS=12
+```
+
+`CONTINUOUS_REQUEST_INTERVAL` is the interval between SongRec/Shazam requests
+in continuous mode. Lower values find changes sooner but increase rate-limit
+and false-positive risk. SongRec's continuous command emits a result only when
+its own track key changes, so the worker holds a new result for
+`CHANGE_CONFIRM_SECONDS`. If SongRec returns to the currently displayed song
+during that brief crossfade window, the pending switch is cancelled.
+
+`SONGREC_REQUEST_INTERVAL` and the RMS/silence settings still apply only to
+`DETECTION_MODE=silence`.
+
+
+
+
 ### `DATA_DIR=/var/lib/songrec-station`
 
 The station’s runtime-data directory:
